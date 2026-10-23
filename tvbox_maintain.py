@@ -88,11 +88,13 @@ def load_upstreams():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                if "|" in line:
-                    name, url = line.split("|", 1)
-                    name, url = name.strip(), url.strip()
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 3:
+                    name, url, pin = parts[0], parts[1], parts[2] or None
+                elif len(parts) == 2:
+                    name, url, pin = parts[0], parts[1], None
                 else:
-                    name, url = "", line
+                    name, url, pin = "", parts[0], None
                 if not url.lower().startswith(("http://", "https://")):
                     continue
                 if url in seen:
@@ -100,13 +102,13 @@ def load_upstreams():
                 seen.add(url)
                 if not name:
                     name = urlsplit(url).hostname or url
-                entries.append((name, url))
+                entries.append((name, url, pin))
     except OSError:
         entries = []
     if entries:
         UPSTREAM_ORIGIN = "sources.txt (%d entries)" % len(entries)
         return entries
-    return list(SEEDS)
+    return [(n, u, None) for n, u in SEEDS]
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +161,42 @@ def http_get_full(url, timeout, max_bytes):
         return e.code, body, url
 
 
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def http_get_pinned(url, pin_ip, timeout, max_bytes):
+    """Fetch an http URL from a pinned IP, sending the original Host
+    header and not following redirects — for domains whose DNS is broken
+    or unreachable through normal resolvers (the name may not even exist
+    in public DNS). Returns (status, body, url) like http_get_full, with
+    the ORIGINAL url as the final URL so the config's relative references
+    still resolve against the named host."""
+    parts = urlsplit(url)
+    if parts.scheme != "http" or not pin_ip:
+        return http_get_full(url, timeout, max_bytes)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    req = urlrequest.Request("http://%s%s" % (pin_ip, path), headers={
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Host": parts.netloc,
+    })
+    opener = urlrequest.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read(max_bytes), url
+    except urlerror.HTTPError as e:
+        try:
+            body = e.read(max_bytes)
+        except Exception:
+            body = b""
+        return e.code, body, url
+
+
 def short_err(exc):
     msg = str(exc).strip()
     if not msg:
@@ -194,6 +232,18 @@ def _strip_trailing_commas(text):
     return re.sub(r",\s*([}\]])", r"\1", text)
 
 
+def _loads_tolerant(s):
+    """json.loads with comment / trailing-comma cleanup as a fallback."""
+    for cand in (s, _strip_trailing_commas(_strip_comments(s))):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
 def parse_config(text):
     """Try hard to turn response text into a config dict. Returns dict|None."""
     if not text:
@@ -217,11 +267,23 @@ def parse_config(text):
         for alt in (None, b"-_"):
             try:
                 raw = base64.b64decode(padded, altchars=alt)
-                obj = json.loads(raw.decode("utf-8-sig"))
-                if isinstance(obj, dict):
+                obj = _loads_tolerant(raw.decode("utf-8-sig"))
+                if obj is not None:
                     return obj
             except Exception:
                 continue
+    # Embedded base64 segment: some configs hide behind an image — the
+    # body is JPEG bytes followed by a long base64 run carrying the JSON.
+    runs = sorted(re.findall(r"[A-Za-z0-9+/=]{500,}", t), key=len, reverse=True)
+    for run in runs[:5]:
+        padded = run + "=" * (-len(run) % 4)
+        try:
+            raw = base64.b64decode(padded)
+            obj = _loads_tolerant(raw.decode("utf-8-sig"))
+            if obj is not None:
+                return obj
+        except Exception:
+            continue
     return None
 
 
@@ -361,12 +423,23 @@ def absolutize_config(cfg, base_url):
 # Upstream fetch
 # --------------------------------------------------------------------------
 
-def fetch_upstream(name, url):
+def fetch_upstream(name, url, pin=None):
     rec = {"name": name, "url": url, "ok": False, "reason": "",
            "config": None, "n_sites_raw": 0, "has_spider": False,
            "contributed": 0}
     try:
-        status, raw, final_url = http_get_full(url, FETCH_TIMEOUT, CONFIG_MAX_BYTES)
+        fetched = None
+        if pin:
+            try:
+                got = http_get_pinned(url, pin, FETCH_TIMEOUT, CONFIG_MAX_BYTES)
+                if got[0] == 200:
+                    fetched = got
+                    rec["via"] = "pinned " + pin
+            except Exception:
+                fetched = None
+        if fetched is None:
+            fetched = http_get_full(url, FETCH_TIMEOUT, CONFIG_MAX_BYTES)
+        status, raw, final_url = fetched
     except Exception as e:
         rec["reason"] = short_err(e)
         return rec
@@ -567,7 +640,8 @@ def build_lite(sites):
     return light + heavy[:room]
 
 
-ASSET_SUFFIXES = (".js", ".jar", ".txt", ".m3u", ".m3u8", ".json", ".xml")
+ASSET_SUFFIXES = (".js", ".jar", ".txt", ".m3u", ".m3u8", ".json", ".xml",
+                  ".jpg", ".png")
 
 
 def _asset_local_name(url):
@@ -681,7 +755,7 @@ def main():
     seeds = load_upstreams()
     report.append("upstreams from: %s" % UPSTREAM_ORIGIN)
     with ThreadPoolExecutor(max_workers=max(1, len(seeds))) as ex:
-        ups = list(ex.map(lambda s: fetch_upstream(s[0], s[1]), seeds))
+        ups = list(ex.map(lambda s: fetch_upstream(s[0], s[1], s[2]), seeds))
 
     ok_ups = [u for u in ups if u["ok"]]
     report.append("")
@@ -828,7 +902,7 @@ def main():
         clean_sites.append(cs)
     out_cfg["sites"] = clean_sites
     out_cfg["lives"] = kept_lives
-    for field in ("parses", "flags", "ads"):
+    for field in ("parses", "flags", "ads", "rules", "hosts", "logo"):
         if pcfg.get(field):
             out_cfg[field] = pcfg[field]
 
