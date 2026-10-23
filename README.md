@@ -8,7 +8,7 @@
 2. **合并去重**：`sites` 按 `(type, api, ext)` 去重；各配置里的相对引用（spider、`api`、`ext`、直播地址）按各自上游地址补成绝对地址，避免换发布地址后失效。
 3. **spider 规则**：一份配置只能带一个 spider——取优先级最高且抓取成功的上游为主源，type 3 爬虫站点只收主源配套的；type 0/1/4 采集站点全部合并。
 4. **验活**：type 1 用 `ac=list` 探活并验 JSON 结构；type 0 验 XML 结构；type 4 验可达与 JSON；直播源验列表可下载。当天失败只记账，**连续 2 天失败才剔除**（防误杀）。全部上游都抓不到时不覆盖旧文件。
-5. **发布**：生成 `out/tvbox.json` 与每日报告 `out/report.txt`，由一个极小的静态服务器在局域网提供。
+5. **发布**：生成 `out/tvbox.json` 与每日报告 `out/report.txt`，由一个极小的静态服务器在局域网提供。同时生成**精简版** `out/tvbox-lite.json`：按站名类别前缀剔除听书/音频/体育/少儿等非影视站，总数封顶（默认 110），给配置加载慢的盒子用。
 
 ## 文件
 
@@ -37,7 +37,7 @@ chmod +x run.sh serve.py tvbox_maintain.py
 @reboot /vol1/1000/tvbox-maintainer/run.sh serve-check
 ```
 
-盒子配置地址：`http://<NAS局域网IP>:9977/tvbox.json`，每日报告：`http://<NAS局域网IP>:9977/report.txt`。
+盒子配置地址：`http://<NAS局域网IP>:9977/tvbox.json`（精简版：`http://<NAS局域网IP>:9977/tvbox-lite.json`），每日报告：`http://<NAS局域网IP>:9977/report.txt`。
 
 手动跑一轮：`python3 tvbox_maintain.py`（`sources.txt` 不存在或为空时回退到程序内置种子）；也可以在局域网浏览器打开 `http://<NAS局域网IP>:9977/run` 一键触发（同一时间只跑一轮，重复打开会提示运行中）。
 

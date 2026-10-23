@@ -513,6 +513,32 @@ def site_type(site):
 # Main
 # --------------------------------------------------------------------------
 
+LITE_CAP = 110
+LITE_DROP_PREFIXES = {"听书", "音频", "MV", "体育", "少儿", "广播", "科普",
+                      "配置", "书籍", "相声", "评书", "游戏"}
+LITE_DROP_KEYWORDS = ("小说", "漫画", "短视频", "抖音", "快手", "壁纸")
+
+
+def build_lite(sites):
+    """Slim edition for slow TV boxes: drop non-video buckets (by the
+    '类别 | 站名' name-prefix convention and name keywords), then cap the
+    total. Non-spider (type 0/1/4) sites are always kept; type-3 sites
+    fill the remaining quota in upstream order."""
+    cand = []
+    for s in sites:
+        name = s.get("name") or ""
+        prefix = name.split("|")[0].strip() if "|" in name else ""
+        if prefix in LITE_DROP_PREFIXES:
+            continue
+        if any(k in name for k in LITE_DROP_KEYWORDS):
+            continue
+        cand.append(s)
+    light = [s for s in cand if s.get("type") != 3]
+    heavy = [s for s in cand if s.get("type") == 3]
+    room = max(0, LITE_CAP - len(light))
+    return light + heavy[:room]
+
+
 def main():
     started = time.time()
     now = datetime.now()
@@ -681,6 +707,15 @@ def main():
         json.dump(out_cfg, f, ensure_ascii=False, indent=2)
     out_size = os.path.getsize(out_path)
 
+    # ---- lite edition: non-video buckets dropped, total capped ----
+    lite_sites = build_lite(clean_sites)
+    lite_cfg = dict(out_cfg)
+    lite_cfg["sites"] = lite_sites
+    lite_path = os.path.join(OUT_DIR, "tvbox-lite.json")
+    with open(lite_path, "w", encoding="utf-8") as f:
+        json.dump(lite_cfg, f, ensure_ascii=False, indent=2)
+    lite_size = os.path.getsize(lite_path)
+
     # ---- report ----
     report.append("")
     report.append("[sites]")
@@ -712,6 +747,8 @@ def main():
         report.append("  ... and %d more" % (len(dead_samples) - 40))
     report.append("")
     report.append("[output] %s (%d bytes), runtime %.1fs" % (out_path, out_size, time.time() - started))
+    report.append("[lite] %s (%d bytes), %d sites (non-video dropped, cap %d)"
+                  % (lite_path, lite_size, len(lite_sites), LITE_CAP))
     _write_report(report)
 
     print("\n".join(report))
