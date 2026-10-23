@@ -39,7 +39,7 @@ chmod +x run.sh serve.py tvbox_maintain.py
 
 盒子配置地址：`http://<NAS局域网IP>:9977/tvbox.json`，每日报告：`http://<NAS局域网IP>:9977/report.txt`。
 
-手动跑一轮：`python3 tvbox_maintain.py`（`sources.txt` 不存在或为空时回退到程序内置种子）。
+手动跑一轮：`python3 tvbox_maintain.py`（`sources.txt` 不存在或为空时回退到程序内置种子）；也可以在局域网浏览器打开 `http://<NAS局域网IP>:9977/run` 一键触发（同一时间只跑一轮，重复打开会提示运行中）。
 
 ## 已知限制
 
