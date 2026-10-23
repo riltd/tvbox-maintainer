@@ -71,6 +71,8 @@ SEEDS = [
 ]
 
 SOURCES_PATH = os.path.join(BASE, "sources.txt")
+DENYLIST_PATH = os.path.join(BASE, "denylist.txt")
+PUBLIC_BASE_PATH = os.path.join(BASE, "public_base.txt")
 UPSTREAM_ORIGIN = "built-in seeds"
 
 
@@ -657,16 +659,9 @@ def _is_mirrorable(url):
     return urlsplit(url).path.lower().endswith(ASSET_SUFFIXES)
 
 
-def mirror_assets(out_cfg, sites, lives):
-    """Download the spider jar, type-3 JS rules and live lists into
-    out/assets/ and rewrite the references to './assets/<file>' — the
-    player resolves them against the config URL, i.e. this server. The
-    box then loads everything over the LAN instead of crawling to the
-    original (often overseas / throttled) hosts; the maintainer fetches
-    the assets once a day. An asset that fails to download keeps its
-    original URL. Returns (mirrored, failed)."""
-    targets = {}
-
+def collect_asset_targets(out_cfg, sites, lives, targets):
+    """Add every mirrorable static reference of one config (spider jar,
+    type-3 JS rules, live lists) to the shared targets dict url -> name."""
     def want(url):
         if _is_mirrorable(url):
             targets.setdefault(url, _asset_local_name(url))
@@ -687,8 +682,16 @@ def mirror_assets(out_cfg, sites, lives):
     for lv in lives:
         want(lv.get("url"))
         want(lv.get("epg"))
+
+
+def download_assets(targets):
+    """Download every target into out/assets/ (the box then loads them
+    over the LAN instead of crawling to the original, often overseas /
+    throttled, hosts). Returns ({url: bool}, {url: md5hex}); failures
+    keep their original URLs."""
+    import hashlib
     if not targets:
-        return 0, 0
+        return {}, {}
     assets_dir = os.path.join(OUT_DIR, "assets")
     os.makedirs(assets_dir, exist_ok=True)
 
@@ -697,23 +700,35 @@ def mirror_assets(out_cfg, sites, lives):
         try:
             status, body = http_get(url, 20, CONFIG_MAX_BYTES)
             if status != 200 or not body:
-                return url, False
+                return url, False, ""
             tmp = os.path.join(assets_dir, name + ".tmp")
             with open(tmp, "wb") as f:
                 f.write(body)
             os.replace(tmp, os.path.join(assets_dir, name))
-            return url, True
+            return url, True, hashlib.md5(body).hexdigest()
         except Exception:
-            return url, False
+            return url, False, ""
 
-    ok = {}
+    ok, md5s = {}, {}
     with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
-        for url, good in ex.map(fetch, sorted(targets.items())):
+        for url, good, md5hex in ex.map(fetch, sorted(targets.items())):
             ok[url] = good
+            if good:
+                md5s[url] = md5hex
+    return ok, md5s
 
+
+def swap_asset_refs(out_cfg, sites, lives, targets, ok, prefix, md5s=None):
+    """Rewrite mirrored references to '<prefix><file>' (the prefix is
+    relative to wherever the config file itself is served from). When a
+    spider's declared md5 does not match the mirrored jar's real hash
+    (upstream shipped a stale label), correct the label to the real
+    hash — the jar bytes are the author's own, only the label is fixed,
+    otherwise the player would reject the jar. Returns the number of
+    md5 labels corrected."""
     def swap(url):
         if url in targets and ok.get(url):
-            return "./assets/" + targets[url]
+            return prefix + targets[url]
         return url
 
     def swap_compound(value):
@@ -725,9 +740,18 @@ def mirror_assets(out_cfg, sites, lives):
             segs[1] = swap(segs[1])
         return "$$$".join(segs)
 
+    fixed = 0
+    spider = out_cfg.get("spider")
     if isinstance(spider, str) and spider:
         parts = spider.split(";")
+        orig_url = parts[0]
         parts[0] = swap(parts[0])
+        if (md5s and parts[0] != orig_url and len(parts) >= 3
+                and parts[1] == "md5"):
+            real = md5s.get(orig_url)
+            if real and real != parts[2]:
+                parts[2] = real
+                fixed += 1
         out_cfg["spider"] = ";".join(parts)
     for s in sites:
         if s.get("type") == 3:
@@ -740,8 +764,42 @@ def mirror_assets(out_cfg, sites, lives):
             lv["url"] = swap(lv["url"])
         if isinstance(lv.get("epg"), str):
             lv["epg"] = swap(lv["epg"])
-    good_n = sum(1 for v in ok.values() if v)
-    return good_n, len(ok) - good_n
+    return fixed
+
+
+def load_denylist():
+    """Keywords from denylist.txt next to this script (one per line, '#'
+    comments ignored). A site is dropped when a keyword appears in its
+    name or api (case-insensitive). Missing file = no filtering."""
+    kws = []
+    try:
+        with open(DENYLIST_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    kws.append(line.lower())
+    except OSError:
+        pass
+    return kws
+
+
+def load_public_base():
+    """Base URL the player uses to reach this server, from public_base.txt
+    next to this script (e.g. 'http://192.168.1.11:9977/'). Used to build
+    absolute entries in the multi-repo index (repos.json). '' when unset."""
+    try:
+        with open(PUBLIC_BASE_PATH, "r", encoding="utf-8") as f:
+            base = f.read().strip()
+        if not base:
+            return ""
+        return base if base.endswith("/") else base + "/"
+    except OSError:
+        return ""
+
+
+def site_denied(site, kws):
+    hay = ((site.get("name") or "") + " " + (site.get("api") or "")).lower()
+    return any(k in hay for k in kws)
 
 
 def main():
@@ -832,6 +890,13 @@ def main():
             seen_lives.add(nm)
             lives_merged.append(dict(lv))
 
+    # ---- denylist filter (user-curated: drop whole site families) ----
+    deny_kws = load_denylist()
+    if deny_kws:
+        before = len(merged)
+        merged = [s for s in merged if not site_denied(s, deny_kws)]
+        report.append("  denylist dropped: %d sites" % (before - len(merged)))
+
     # ---- classify + probe sites ----
     probe_tasks = []
     verdicts = {}   # id(site) -> (verdict, reason)
@@ -849,7 +914,7 @@ def main():
 
     # ---- probe lives ----
     live_tasks = [lv for lv in lives_merged
-                  if isinstance(lv.get("url", ""), str)
+                  if isinstance(lv.get("url"), str)
                   and lv["url"].startswith(("http://", "https://"))]
     live_probe = run_probes(live_tasks, "live")
     kept_lives, dropped_lives = [], []
@@ -906,7 +971,34 @@ def main():
         if pcfg.get(field):
             out_cfg[field] = pcfg[field]
 
-    n_assets_ok, n_assets_fail = mirror_assets(out_cfg, clean_sites, kept_lives)
+    # ---- multi-repo shelf: one standalone config per spider upstream ----
+    repo_cfgs = []   # (slug, display name, cfg, sites, lives)
+    for i, u in enumerate(ok_ups):
+        ucfg = u["config"]
+        if not ucfg.get("spider"):
+            continue
+        rcfg = json.loads(json.dumps(ucfg))
+        rsites = [s for s in rcfg.get("sites", []) if isinstance(s, dict)]
+        if deny_kws:
+            rsites = [s for s in rsites if not site_denied(s, deny_kws)]
+        rcfg["sites"] = rsites
+        rlives = [lv for lv in rcfg.get("lives", []) if isinstance(lv, dict)]
+        rcfg["lives"] = rlives
+        repo_cfgs.append(("pack%d" % (i + 1), u["name"], rcfg, rsites, rlives))
+
+    # ---- mirror assets for the main config and every repo config ----
+    targets = {}
+    collect_asset_targets(out_cfg, clean_sites, kept_lives, targets)
+    for _slug, _nm, rcfg, rsites, rlives in repo_cfgs:
+        collect_asset_targets(rcfg, rsites, rlives, targets)
+    ok_map, md5_map = download_assets(targets)
+    n_md5_fixed = swap_asset_refs(out_cfg, clean_sites, kept_lives,
+                                  targets, ok_map, "./assets/", md5_map)
+    for _slug, _nm, rcfg, rsites, rlives in repo_cfgs:
+        n_md5_fixed += swap_asset_refs(rcfg, rsites, rlives,
+                                       targets, ok_map, "../assets/", md5_map)
+    n_assets_ok = sum(1 for v in ok_map.values() if v)
+    n_assets_fail = len(ok_map) - n_assets_ok
 
     os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(OUT_DIR, "tvbox.json")
@@ -958,6 +1050,26 @@ def main():
                   % (lite_path, lite_size, len(lite_sites), LITE_CAP))
     report.append("[assets] mirrored %d to ./assets/, %d kept remote (download failed)"
                   % (n_assets_ok, n_assets_fail))
+    if n_md5_fixed:
+        report.append("[spider] corrected %d stale md5 label(s) to the mirrored jar's real hash"
+                      % n_md5_fixed)
+
+    # ---- emit the multi-repo shelf + its index ----
+    shelf_entries = []
+    if repo_cfgs:
+        repo_dir = os.path.join(OUT_DIR, "repo")
+        os.makedirs(repo_dir, exist_ok=True)
+        pbase = load_public_base()
+        shelf_entries.append({"name": "每日维护·合并版", "url": pbase + "tvbox.json"})
+        for slug, nm, rcfg, _rs, _rl in repo_cfgs:
+            with open(os.path.join(repo_dir, slug + ".json"), "w", encoding="utf-8") as f:
+                json.dump(rcfg, f, ensure_ascii=False, indent=2)
+            shelf_entries.append({"name": nm, "url": pbase + "repo/" + slug + ".json"})
+        with open(os.path.join(OUT_DIR, "repos.json"), "w", encoding="utf-8") as f:
+            json.dump({"urls": shelf_entries}, f, ensure_ascii=False, indent=2)
+        report.append("[repos] repos.json: %d entries (%s)"
+                      % (len(shelf_entries),
+                         ", ".join(e["name"] for e in shelf_entries)))
     _write_report(report)
 
     print("\n".join(report))
