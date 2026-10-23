@@ -1,0 +1,11 @@
+# TVBox 源清单 —— 每天 04:30 按此清单自动抓取、合并、验活
+# 用法：一行一个地址；可以写「名称 | 网址」，也可以只写网址（名称自动取域名）
+# 以 # 开头的行是注释，会被忽略；网址重复也没关系，自动去重
+# 收集到新地址就粘贴到下面保存，第二天凌晨自动生效；想立刻生效喊 Kavi 跑一轮
+饭太硬 | http://www.饭太硬.com/tv/
+肥猫 | http://肥猫.com
+王二小 | http://tvbox.王二小放牛娃.top
+讴歌 | http://tv.nxog.top/m/
+巧技 | http://cdn.qiaoji8.com/tvbox.json
+春盈天下 | https://盒子迷.top/春盈天下
+qist-js | https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json
