@@ -280,6 +280,30 @@ def _resolve_spider(value, base):
     return ";".join(parts)
 
 
+def _split_compound(value):
+    """drpy api/ext values can be '$$$'-separated parameter lists whose
+    first one or two segments are file references (token file, share
+    list); the remaining segments are runtime parameters. Returns the
+    segment list, or None when the value is not compound."""
+    if isinstance(value, str) and "$$$" in value:
+        return value.split("$$$")
+    return None
+
+
+def _resolve_compound(value, base):
+    """Resolve only the file-reference segments of a compound value and
+    rejoin with literal '$$$'. (Feeding the whole string through URL
+    joining/quoting would percent-encode the separators and parameters
+    and corrupt the value.)"""
+    segs = _split_compound(value)
+    if segs is None:
+        return None
+    segs[0] = _resolve_ref(segs[0], base)
+    if len(segs) > 1:
+        segs[1] = _resolve_ref(segs[1], base)
+    return "$$$".join(segs)
+
+
 def _resolve_ext(value, base):
     """Only plain-string path exts are resolved. Dict/list exts, JSON-encoded
     strings, tokens and other values are left exactly as they are."""
@@ -293,6 +317,9 @@ def _resolve_ext(value, base):
         return value
     except Exception:
         pass
+    comp = _resolve_compound(value, base)
+    if comp is not None:
+        return comp
     return _resolve_ref(value, base)
 
 
@@ -309,7 +336,8 @@ def absolutize_config(cfg, base_url):
             if isinstance(s, dict):
                 s = dict(s)
                 if s.get("api"):
-                    s["api"] = _resolve_ref(s["api"], base_url)
+                    comp = _resolve_compound(s["api"], base_url)
+                    s["api"] = comp if comp is not None else _resolve_ref(s["api"], base_url)
                 if "ext" in s:
                     s["ext"] = _resolve_ext(s["ext"], base_url)
             new_sites.append(s)
@@ -539,6 +567,109 @@ def build_lite(sites):
     return light + heavy[:room]
 
 
+ASSET_SUFFIXES = (".js", ".jar", ".txt", ".m3u", ".m3u8", ".json", ".xml")
+
+
+def _asset_local_name(url):
+    import hashlib
+    base = urlsplit(url).path.rsplit("/", 1)[-1] or "asset"
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return "%s-%s" % (hashlib.sha1(url.encode("utf-8")).hexdigest()[:8], base)
+
+
+def _is_mirrorable(url):
+    if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+        return False
+    return urlsplit(url).path.lower().endswith(ASSET_SUFFIXES)
+
+
+def mirror_assets(out_cfg, sites, lives):
+    """Download the spider jar, type-3 JS rules and live lists into
+    out/assets/ and rewrite the references to './assets/<file>' — the
+    player resolves them against the config URL, i.e. this server. The
+    box then loads everything over the LAN instead of crawling to the
+    original (often overseas / throttled) hosts; the maintainer fetches
+    the assets once a day. An asset that fails to download keeps its
+    original URL. Returns (mirrored, failed)."""
+    targets = {}
+
+    def want(url):
+        if _is_mirrorable(url):
+            targets.setdefault(url, _asset_local_name(url))
+
+    spider = out_cfg.get("spider")
+    if isinstance(spider, str) and spider:
+        want(spider.split(";")[0])
+    for s in sites:
+        if s.get("type") == 3:
+            for field in ("api", "ext"):
+                segs = _split_compound(s.get(field))
+                if segs is None:
+                    want(s.get(field))
+                else:
+                    want(segs[0])
+                    if len(segs) > 1:
+                        want(segs[1])
+    for lv in lives:
+        want(lv.get("url"))
+        want(lv.get("epg"))
+    if not targets:
+        return 0, 0
+    assets_dir = os.path.join(OUT_DIR, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+
+    def fetch(item):
+        url, name = item
+        try:
+            status, body = http_get(url, 20, CONFIG_MAX_BYTES)
+            if status != 200 or not body:
+                return url, False
+            tmp = os.path.join(assets_dir, name + ".tmp")
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, os.path.join(assets_dir, name))
+            return url, True
+        except Exception:
+            return url, False
+
+    ok = {}
+    with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as ex:
+        for url, good in ex.map(fetch, sorted(targets.items())):
+            ok[url] = good
+
+    def swap(url):
+        if url in targets and ok.get(url):
+            return "./assets/" + targets[url]
+        return url
+
+    def swap_compound(value):
+        segs = _split_compound(value)
+        if segs is None:
+            return swap(value)
+        segs[0] = swap(segs[0])
+        if len(segs) > 1:
+            segs[1] = swap(segs[1])
+        return "$$$".join(segs)
+
+    if isinstance(spider, str) and spider:
+        parts = spider.split(";")
+        parts[0] = swap(parts[0])
+        out_cfg["spider"] = ";".join(parts)
+    for s in sites:
+        if s.get("type") == 3:
+            if isinstance(s.get("api"), str):
+                s["api"] = swap_compound(s["api"])
+            if isinstance(s.get("ext"), str):
+                s["ext"] = swap_compound(s["ext"])
+    for lv in lives:
+        if isinstance(lv.get("url"), str):
+            lv["url"] = swap(lv["url"])
+        if isinstance(lv.get("epg"), str):
+            lv["epg"] = swap(lv["epg"])
+    good_n = sum(1 for v in ok.values() if v)
+    return good_n, len(ok) - good_n
+
+
 def main():
     started = time.time()
     now = datetime.now()
@@ -701,6 +832,8 @@ def main():
         if pcfg.get(field):
             out_cfg[field] = pcfg[field]
 
+    n_assets_ok, n_assets_fail = mirror_assets(out_cfg, clean_sites, kept_lives)
+
     os.makedirs(OUT_DIR, exist_ok=True)
     out_path = os.path.join(OUT_DIR, "tvbox.json")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -749,6 +882,8 @@ def main():
     report.append("[output] %s (%d bytes), runtime %.1fs" % (out_path, out_size, time.time() - started))
     report.append("[lite] %s (%d bytes), %d sites (non-video dropped, cap %d)"
                   % (lite_path, lite_size, len(lite_sites), LITE_CAP))
+    report.append("[assets] mirrored %d to ./assets/, %d kept remote (download failed)"
+                  % (n_assets_ok, n_assets_fail))
     _write_report(report)
 
     print("\n".join(report))
